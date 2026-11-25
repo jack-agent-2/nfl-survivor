@@ -137,6 +137,7 @@ def load_week(week):
         teams = {c["homeAway"]: c for c in comp["competitors"]}
         if "home" not in teams or "away" not in teams:
             continue
+        done = bool(comp.get("status", ev.get("status", {})).get("type", {}).get("completed", False))
         games.append({
             "Week": week,
             "event_id": ev["id"],
@@ -144,6 +145,9 @@ def load_week(week):
             "date": pd.to_datetime(ev["date"], utc=True),
             "home": sheet_abbr(teams["home"]["team"]["abbreviation"]),
             "away": sheet_abbr(teams["away"]["team"]["abbreviation"]),
+            # Final scores of finished games, used by Odds Predictions for recent point differential
+            "home_score": pd.to_numeric(teams["home"].get("score"), errors="coerce") if done else np.nan,
+            "away_score": pd.to_numeric(teams["away"].get("score"), errors="coerce") if done else np.nan,
         })
     return games
 
@@ -302,21 +306,89 @@ if len(futures) < 32:
         [futures, api_futures[~api_futures["Team"].isin(futures["Team"])]], ignore_index=True)
     print(f"Futures after API fallback: {len(futures)} teams")
 
+# ---- Current team strength: ESPN Football Power Index (FPI) ----
+# FPI is ESPN's rating of how good each team is right now (points better than an average team on a
+# neutral field), and it reacts to injuries such as a starting QB going out. Free, no key needed.
+# If ESPN changes the endpoint, FPI is left blank and Odds Predictions simply doesn't use it.
+EXTRA_COLS = ["FPI", "FPI_Proj_Wins", "FPI_Opp", "FPI_Proj_Wins_Opp", "Team_Score", "Opp_Score"]
+
+
+def _num(v):
+    try:
+        return float(str(v).replace("+", "").replace(",", ""))
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def fpi_from_site_api():
+    data = get_json("https://site.web.api.espn.com/apis/fitt/v3/sports/football/nfl/powerindex",
+                    params={"region": "us", "lang": "en", "season": SEASON, "limit": 50})
+    # Stat names for each category, e.g. {"fpi": ["fpi", "fpirk", "trend", "projw", ...]}
+    names = {c.get("name"): [str(n).lower() for n in (c.get("names") or [])]
+             for c in data.get("categories", [])}
+    out = []
+    for t in data.get("teams", []):
+        team = sheet_abbr((t.get("team") or {}).get("abbreviation", ""))
+        stats = {}
+        for c in t.get("categories", []):
+            vals = c.get("values") or c.get("totals") or []
+            stats.update(zip(names.get(c.get("name"), []), vals))
+        out.append({"Team": team, "FPI": _num(stats.get("fpi")),
+                    "FPI_Proj_Wins": _num(stats.get("projw", stats.get("projectedwins")))})
+    return pd.DataFrame(out)
+
+
+def fpi_from_core_api():
+    data = get_json(f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/{SEASON}/powerindex",
+                    params={"limit": 50})
+    out = []
+    for it in data.get("items", []):
+        if "stats" not in it and "$ref" in it:
+            it = get_json(it["$ref"].replace("http://", "https://"))
+        ref = (it.get("team") or {}).get("$ref")
+        if not ref:
+            continue
+        team = sheet_abbr(get_json(ref.replace("http://", "https://"))["abbreviation"])
+        stats = {str(s.get("name", "")).lower(): s.get("value") for s in it.get("stats", [])}
+        out.append({"Team": team, "FPI": _num(stats.get("fpi")),
+                    "FPI_Proj_Wins": _num(stats.get("projw", stats.get("projectedwins")))})
+    return pd.DataFrame(out)
+
+
+fpi = pd.DataFrame(columns=["Team", "FPI", "FPI_Proj_Wins"])
+for source in (fpi_from_site_api, fpi_from_core_api):
+    try:
+        got = source()
+        if got["FPI"].notna().sum() >= 28:
+            fpi = got.dropna(subset=["FPI"]).drop_duplicates("Team")
+            print(f"FPI from {source.__name__}: {len(fpi)} teams")
+            break
+        print(f"FPI from {source.__name__} had only {got['FPI'].notna().sum()} teams; trying the next source")
+    except Exception as e:
+        print(f"Couldn't read FPI from {source.__name__} ({e})")
+if fpi.empty:
+    print("No FPI this run; Odds Predictions will skip it")
+fpi = fpi[["Team", "FPI", "FPI_Proj_Wins"]].astype({"FPI": float, "FPI_Proj_Wins": float})
+
 home_rows = pd.DataFrame({
     "Week": games_df["Week"], "Team": games_df["home"], "Opp": games_df["away"],
     "Team_Opp": games_df["away"], "Home": 1, "Target": games_df["home_ml"],
+    "Team_Score": games_df["home_score"], "Opp_Score": games_df["away_score"],
 })
 away_rows = pd.DataFrame({
     "Week": games_df["Week"], "Team": games_df["away"], "Opp": games_df["home"],
     "Team_Opp": "@" + games_df["home"], "Home": 0, "Target": games_df["away_ml"],
+    "Team_Score": games_df["away_score"], "Opp_Score": games_df["home_score"],
 })
 rows = pd.concat([home_rows, away_rows], ignore_index=True)
 
 opp_futures = futures.rename(columns={c: f"{c}_Opp" for c in FUTURE_COLS}).rename(columns={"Team": "Opp"})
 rows = rows.merge(futures, on="Team", how="left").merge(opp_futures, on="Opp", how="left")
+rows = rows.merge(fpi, on="Team", how="left").merge(
+    fpi.rename(columns={"Team": "Opp", "FPI": "FPI_Opp", "FPI_Proj_Wins": "FPI_Proj_Wins_Opp"}), on="Opp", how="left")
 
 columns = (["Week", "Team", "Team_Opp"] + FUTURE_COLS + ["Home"]
-           + [f"{c}_Opp" for c in FUTURE_COLS] + ["Target"])
+           + [f"{c}_Opp" for c in FUTURE_COLS] + EXTRA_COLS + ["Target"])
 csv_export = rows[columns].sort_values(["Week", "Team"]).reset_index(drop=True)
 csv_export["Week"] = csv_export["Week"].astype(int)
 csv_export["Home"] = csv_export["Home"].astype(int)
@@ -358,7 +430,7 @@ history["days_to_kickoff"] = ((pd.to_datetime(history["kickoff"], utc=True) - fe
 history = history.rename(columns={"Target": "moneyline"})
 history_cols = (["fetched_date", "fetched_at", "season", "current_week", "Week", "Team", "Opp", "Team_Opp",
                  "Home", "kickoff", "days_to_kickoff", "moneyline"]
-                + FUTURE_COLS + [f"{c}_Opp" for c in FUTURE_COLS])
+                + FUTURE_COLS + [f"{c}_Opp" for c in FUTURE_COLS] + EXTRA_COLS)
 history = history[history_cols]
 
 history_dir = os.path.join(here, "history")
