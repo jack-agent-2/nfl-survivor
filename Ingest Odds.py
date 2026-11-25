@@ -32,6 +32,9 @@ dbutils.widgets.dropdown("data_source", "auto", ["auto", "web", "github", "volum
 dbutils.widgets.text("github_data_url", "", "GitHub raw data folder, e.g. https://raw.githubusercontent.com/<you>/<repo>/main/data")
 DATA_SOURCE = dbutils.widgets.get("data_source")
 GITHUB_DATA_URL = dbutils.widgets.get("github_data_url").strip().rstrip("/")
+dbutils.widgets.text("github_token", "", "Only for a private GitHub repo: a read-only access token")
+GITHUB_TOKEN = dbutils.widgets.get("github_token").strip()
+GITHUB_HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 VOLUME = "/Volumes/workspace/default/nfl_survivor"
 
 OUTPUT_TABLE = "workspace.default.nfl_survivor_csv_export"
@@ -63,10 +66,12 @@ if source in ("github", "volume"):
     if source == "github":
         if not GITHUB_DATA_URL:
             raise Exception("Set the github_data_url job parameter (see Job setup.md).")
-        r = requests.get(f"{GITHUB_DATA_URL}/nfl_survivor_csv_export.csv", timeout=30)
+        r = requests.get(f"{GITHUB_DATA_URL}/nfl_survivor_csv_export.csv", headers=GITHUB_HEADERS, timeout=30)
+        if r.status_code == 404:
+            raise Exception("GitHub returned 404. If the repo is private, make it public or set the github_token job parameter (see Job setup.md).")
         r.raise_for_status()
         csv_export = pd.read_csv(io.StringIO(r.text))
-        current_week = int(requests.get(f"{GITHUB_DATA_URL}/current_week.txt", timeout=30).text.strip())
+        current_week = int(requests.get(f"{GITHUB_DATA_URL}/current_week.txt", headers=GITHUB_HEADERS, timeout=30).text.strip())
         where = GITHUB_DATA_URL
     else:
         csv_path = f"{VOLUME}/nfl_survivor_csv_export.csv"

@@ -6,7 +6,8 @@ so Databricks Free Edition can read the result from raw.githubusercontent.com.
 It can also run on a normal PC and upload straight to a Databricks volume.
 It does the same work as the "Ingest Odds" notebook: it pulls the schedule, moneylines and
 futures from ESPN, builds the CSV Export table, and then:
-  1. saves nfl_survivor_csv_export.csv and current_week.txt next to this script
+  1. saves nfl_survivor_csv_export.csv and current_week.txt next to this script, plus odds history:
+     history/YYYY-MM-DD.csv (today's snapshot) and odds_history.csv (every day so far, long format)
   2. uploads both to the Databricks volume /Volumes/workspace/default/nfl_survivor/
   3. optionally starts your Databricks job (--job-id)
 
@@ -335,6 +336,46 @@ csv_export.to_csv(csv_path, index=False)
 with open(week_path, "w") as f:
     f.write(str(current_week))
 print(f"Saved {csv_path}")
+
+# ---- Odds history: a dated snapshot plus one combined long-format file ----
+# Lets Odds Predictions and the robustness simulation learn how lines really move.
+# One row per team per game per fetch day. Running twice on the same day replaces that day's rows.
+fetched_at = pd.Timestamp.now(tz="UTC")
+fetched_date = fetched_at.strftime("%Y-%m-%d")
+kickoffs = pd.concat([
+    games_df[["Week", "home", "date"]].rename(columns={"home": "Team"}),
+    games_df[["Week", "away", "date"]].rename(columns={"away": "Team"}),
+]).drop_duplicates(["Week", "Team"])
+history = csv_export.merge(kickoffs, on=["Week", "Team"], how="left")
+history.insert(0, "fetched_date", fetched_date)
+history.insert(1, "fetched_at", fetched_at.strftime("%Y-%m-%dT%H:%M:%SZ"))
+history.insert(2, "season", SEASON)
+history.insert(3, "current_week", current_week)
+history["Opp"] = history["Team_Opp"].astype(str).str.lstrip("@")
+history["kickoff"] = history.pop("date").dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+history["days_to_kickoff"] = ((pd.to_datetime(history["kickoff"], utc=True) - fetched_at)
+                              .dt.total_seconds() / 86400).round(2)
+history = history.rename(columns={"Target": "moneyline"})
+history_cols = (["fetched_date", "fetched_at", "season", "current_week", "Week", "Team", "Opp", "Team_Opp",
+                 "Home", "kickoff", "days_to_kickoff", "moneyline"]
+                + FUTURE_COLS + [f"{c}_Opp" for c in FUTURE_COLS])
+history = history[history_cols]
+
+history_dir = os.path.join(here, "history")
+os.makedirs(history_dir, exist_ok=True)
+snapshot_path = os.path.join(history_dir, f"{fetched_date}.csv")
+history.to_csv(snapshot_path, index=False)
+print(f"Saved {snapshot_path}")
+
+combined_path = os.path.join(here, "odds_history.csv")
+if os.path.exists(combined_path):
+    old = pd.read_csv(combined_path)
+    old = old[old["fetched_date"].astype(str) != fetched_date]
+    combined = pd.concat([old, history], ignore_index=True)
+else:
+    combined = history
+combined.to_csv(combined_path, index=False)
+print(f"Saved {combined_path}: {len(combined)} rows over {combined['fetched_date'].nunique()} day(s)")
 
 # ---- Upload to Databricks and start the job ----
 if not args.no_upload:
